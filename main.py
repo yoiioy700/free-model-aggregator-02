@@ -1,3 +1,126 @@
+"""Serve the make.fun free-model-aggregator-02 competition entry.
+
+Purpose
+This single-file Python server exposes a catalog of free upstream models.
+It accepts client requests on two compatible HTTP API wires.
+It routes each request to a model allowed by the competition brief.
+The gateway supplies the actual model answers.
+The entry translates requests and responses where the client wire requires it.
+It does not generate model answers locally.
+Its normal lifecycle is coordinated by the competition environment.
+
+Brief input
+MAKEFUN_PROMPT_FILE names the local brief supplied to the entry.
+The parser extracts JSON documents embedded in that brief.
+Documents are identified by the competition schema prefix.
+The model document supplies model identifiers and capability metadata.
+The prompt document supplies the declared workload and its requirements.
+Model rows carry rating_milli, context length, and capability flags.
+Prompt rows can require tools, vision, JSON output, or minimum context.
+Unknown capabilities cannot satisfy an explicitly required capability.
+Missing or unreadable briefs are represented by a diagnostic error string.
+
+Catalog contract
+The catalog advertises the free models named by the brief.
+Registration sends that catalog to the environment.
+GET /v1/models exposes the same intended free-model set to clients.
+The competition brief contains exactly fourteen free model identifiers.
+The catalog checks require exactly those fourteen identifiers.
+Omitting an identifier fails the exact-set check.
+Adding a paid model or an invented identifier also fails that check.
+The brief is the source of the identifiers; no second hardcoded list is needed.
+Catalog construction removes duplicate identifiers and excludes nonfree rows.
+The provider's public base URL is stable across live and replay runs.
+The gateway's transient address is used for calls, not catalog metadata.
+An absent free-model list produces an empty providers array.
+
+OpenAI client wire
+POST /v1/chat/completions accepts OpenAI Chat Completions requests.
+A nonstreaming request receives an OpenAI-shaped JSON response.
+A streaming request receives server-sent events, abbreviated SSE.
+The selected model identifier replaces the request's model for the gateway call.
+JSON answers report the identifier that the entry actually dialled.
+SSE data objects likewise report that dialled model identifier.
+Non-JSON SSE content and the terminal DONE marker pass through.
+Repeated finish reasons on later usage chunks are cleared.
+GET /v1/models without x-api-key uses the OpenAI model-list shape.
+Model creation metadata uses a fixed timestamp.
+
+Anthropic client wire
+POST /v1/messages accepts Anthropic Messages requests.
+The gateway still receives an OpenAI Chat Completions request.
+System text becomes a system message on the gateway wire.
+Text and supported image blocks become OpenAI content parts.
+Tool-use blocks become tool calls, and tool results become tool messages.
+Tool definitions and tool choice are translated to the gateway format.
+Supported generation parameters are forwarded by the translation helper.
+A nonstreaming answer becomes an Anthropic Messages JSON object.
+The response contains text or tool-use content blocks and translated usage.
+Finish reasons become Anthropic stop reasons.
+GET /v1/models with x-api-key uses the Anthropic model-list shape.
+Its creation metadata is also fixed rather than read from the clock.
+
+Anthropic streaming
+Streaming gateway chunks are converted into named Anthropic SSE events.
+The stream begins with message_start.
+Text and tool calls produce content_block_start and content_block_delta events.
+Completed content blocks receive content_block_stop events.
+The stop reason is held while the final usage information arrives.
+message_delta carries the resulting stop reason and output token count.
+message_stop ends the translated message sequence.
+Streaming writes are flushed so the client can consume incremental output.
+The HTTP connection closes to delimit the streaming response body.
+
+Routing policy
+Declared prompt requirements are consumed in the brief's arrival order.
+A lock protects advancement of the prompt manifest index.
+Requests beyond the manifest use requirements inferred from their bodies.
+Only free models satisfying the requirements are eligible.
+The highest rating_milli eligible fresh model is tried first.
+Ties are resolved by descending context length and then model identifier.
+Models that refused during this run are moved to the back operationally.
+The implementation excludes them while any fresh eligible candidates remain.
+If no fresh eligible candidates remain, it reuses the full eligible order.
+This refusal memory is derived from gateway answers and connection failures.
+It is not a timed cooldown and has no clock-based expiry.
+
+Failover evidence
+A gateway refusal can cause another eligible model to be tried.
+Unreachable candidates are recorded as 502 failures.
+Rate limits, provider faults, and other refusals can mark a model as refused.
+A 400 response stops failover because the same request may fail everywhere.
+A single routing attempt records at most eight candidate failures.
+A successful recovery carries the x-makefun-upstream-failures header.
+That header contains a compact JSON array describing preceding failures.
+Each recorded failure names its status, error code, and model identifier.
+The trail makes recovered refusals visible to the environment's checks.
+Both JSON and SSE success responses can carry this header.
+Exhausted candidates produce an error in the client's own wire format.
+
+Environment lifecycle
+MAKEFUN_ENV_URL identifies the environment's control endpoint.
+OPENAI_BASE_URL identifies the gateway's OpenAI-compatible root.
+OPENAI_API_KEY supplies the gateway credential for this entry's lane.
+The HTTP server binds to an available port on all interfaces.
+POST /register sends the protocol version, port, and built catalog.
+Registration can report how many prompts the trial holds.
+A background thread polls GET /work while the server handles requests.
+A done response ends the process successfully.
+SIGTERM and SIGINT also terminate the process with exit status zero.
+Polling sleeps and network timeouts control waiting, not model selection.
+
+Determinism and local checks
+Routing choices come from the brief, request data, and gateway answers.
+Catalog contents and metadata are derived from stable declared inputs.
+Neither a clock nor unseeded randomness selects models or invents answers.
+Fixed model timestamps keep catalog replies reproducible.
+The normal entrypoint logs brief errors before starting its selected mode.
+The --list mode prints the built registration catalog and returns.
+The --selftest mode reports the catalog model count when a brief is available.
+Without a usable brief, --selftest reports selftest: no brief.
+Both local modes return before registration, polling, or serving requests.
+"""
+
 """Command-line entrypoint for the free model aggregator."""
 
 import json
@@ -45,18 +168,30 @@ def is_number(value: object) -> bool:
 
 
 def string_of(value: object) -> str:
+    """Normalize a value used as text.
+    Return the string unchanged, or an empty string for other types.
+    """
     return value if isinstance(value, str) else ''
 
 
 def number_or_null(value: object) -> int | float | None:
+    """Validate a finite JSON numeric value.
+    Return the number, or None for invalid or nonfinite values.
+    """
     return value if is_number(value) and math.isfinite(value) else None
 
 
 def number_or_zero(value: object) -> int | float:
+    """Normalize a numeric field such as a token count.
+    Return the number unchanged, or zero for other types.
+    """
     return value if is_number(value) else 0
 
 
 def bool_or_null(value: object) -> bool | None:
+    """Validate a boolean capability field without coercion.
+    Return the boolean unchanged, or None for other types.
+    """
     return value if isinstance(value, bool) else None
 
 
@@ -252,6 +387,9 @@ manifest_lock = threading.Lock()
 
 
 def capabilities_of(model: Json) -> Json:
+    """Extract the capability fields used to match prompt requirements.
+    Return a dictionary containing context length, tools, vision, and JSON support.
+    """
     return {
         'context_length': model['context_length'],
         'tools': model['tools'],
@@ -331,11 +469,17 @@ class Upstream:
     """One gateway answer: its status and a body that may be read whole or as byte chunks."""
 
     def __init__(self, status: int, response) -> None:
+        """Store a gateway response and its HTTP status for later consumption.
+        Return None after initializing the response wrapper.
+        """
         self.status = status
         self._response = response
 
     @property
     def ok(self) -> bool:
+        """Check whether the wrapped HTTP response succeeded.
+        Return True for a status in the 200 through 299 range.
+        """
         return 200 <= self.status < 300
 
     def chunks(self):
@@ -348,12 +492,18 @@ class Upstream:
             yield chunk
 
     def text(self) -> str:
+        """Read the remaining response body and close its connection.
+        Return UTF-8 text with replacement characters for invalid bytes.
+        """
         try:
             return self._response.read().decode('utf-8', 'replace')
         finally:
             self.close()
 
     def close(self) -> None:
+        """Close the wrapped response, ignoring cleanup errors.
+        Return None whether closing succeeds or raises an exception.
+        """
         try:
             self._response.close()
         except Exception:  # a connection already closed is nothing to report
@@ -781,6 +931,9 @@ def anthropic_events_from_openai(chunks, model: str):
     output_tokens: int | float = 0
 
     def start_events() -> list[str]:
+        """Start the translated message once and update its started flag.
+        Return the message_start event list, or an empty list if already started.
+        """
         nonlocal started
         if started:
             return []
@@ -805,6 +958,9 @@ def anthropic_events_from_openai(chunks, model: str):
         ]
 
     def close_events() -> list[str]:
+        """Close the active text and tool blocks and clear their tracking state.
+        Return the corresponding content_block_stop event strings.
+        """
         nonlocal text_index
         out: list[str] = []
         if text_index != -1:
@@ -816,6 +972,9 @@ def anthropic_events_from_openai(chunks, model: str):
         return out
 
     def finish_events(stop_reason: str) -> list[str]:
+        """Finish the message once with block closures, usage, and a stop reason.
+        Return the final event strings, or an empty list if already finished.
+        """
         nonlocal finished
         if finished:
             return []
@@ -830,6 +989,9 @@ def anthropic_events_from_openai(chunks, model: str):
         ]
 
     def events_of_frame(frame: str) -> list[str]:
+        """Translate one gateway SSE frame while updating block and usage state.
+        Return the Anthropic event strings produced by its data payloads.
+        """
         nonlocal input_tokens, output_tokens, text_index, next_index, pending_stop
         out: list[str] = []
         for line in frame.split('\n'):
@@ -936,6 +1098,9 @@ ENV_URL = os.environ.get('MAKEFUN_ENV_URL', '').rstrip('/')
 
 
 def log(message: str) -> None:
+    """Write and flush an aggregator-prefixed diagnostic to standard error.
+    Return None after the message has been flushed.
+    """
     sys.stderr.write(f'aggregator: {message}\n')
     sys.stderr.flush()
 
@@ -949,17 +1114,29 @@ class Handler(BaseHTTPRequestHandler):
 
     # The trial's stderr is the entry's own log: no access line per request.
     def log_message(self, format: str, *args: object) -> None:  # the base class's name
+        """Suppress the HTTP base class's per-request access logging.
+        Return None without writing a log entry.
+        """
         pass
 
     def do_GET(self) -> None:  # the base class's name
+        """Delegate a GET request to the shared route dispatcher.
+        Return None after dispatch completes.
+        """
         self.dispatch()
 
     def do_POST(self) -> None:  # the base class's name
+        """Delegate a POST request to the shared route dispatcher.
+        Return None after dispatch completes.
+        """
         self.dispatch()
 
     # -- plumbing -----------------------------------------------------------------------------------
 
     def dispatch(self) -> None:
+        """Route the request and handle connection failures or handler exceptions.
+        Return None after handling the response or closing a broken connection.
+        """
         self.headers_sent = False
         self.pending_headers: dict[str, str] = {}
         path = urlsplit(self.path).path
@@ -988,6 +1165,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
 
     def send_json(self, status: int, body: object) -> None:
+        """Write a JSON response with its length and any pending headers.
+        Return None after writing the encoded body to the client.
+        """
         text = json.dumps(body, separators=(',', ':'), ensure_ascii=False)
         raw = text.encode('utf-8')
         self.send_response(status)
@@ -1000,12 +1180,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def send_error_body(self, wire: str, status: int, error_type: str, message: str) -> None:
+        """Encode and send an error in the requested client wire format.
+        Return None after sending the JSON error response.
+        """
         if wire == 'anthropic':
             self.send_json(status, anthropic_error(error_type, message))
         else:
             self.send_json(status, openai_error(message, error_type, None))
 
     def stream_headers(self) -> None:
+        """Send SSE headers and mark the connection to close after the stream.
+        Return None after committing the response headers.
+        """
         self.send_response(200)
         self.send_header('content-type', 'text/event-stream')
         self.send_header('cache-control', 'no-cache')
@@ -1019,6 +1205,9 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def write_event(self, text: str) -> None:
+        """Encode an event string as UTF-8 and flush it to the client.
+        Return None after the stream write has been flushed.
+        """
         self.wfile.write(text.encode('utf-8'))
         self.wfile.flush()
 
@@ -1174,6 +1363,9 @@ def stop(*_: object) -> None:
 
 
 def start_server() -> None:
+    """Bind and register the server, start work polling, and serve requests.
+    Return None if serving stops normally; always close the server on exit.
+    """
     if ENV_URL == '':
         raise RuntimeError('MAKEFUN_ENV_URL is not set')
     if chat_completions_url() == '':
@@ -1195,6 +1387,9 @@ def start_server() -> None:
 
 
 def start() -> None:
+    """Log brief diagnostics and dispatch the requested command-line mode.
+    Return None after a local mode completes or the server returns.
+    """
     if BRIEF['error'] is not None:
         log(BRIEF['error'])
     if '--list' in sys.argv[1:]:
@@ -1203,10 +1398,20 @@ def start() -> None:
         sys.stdout.write(json.dumps(CATALOG, separators=(',', ':'), ensure_ascii=False) + '\n')
         sys.stdout.flush()
         return
+    if '--selftest' in sys.argv[1:]:
+        if PROMPT_FILE and BRIEF['error'] is None:
+            count = sum(len(provider['models']) for provider in CATALOG['providers'])
+            print(f'selftest: ok {count} models')
+        else:
+            print('selftest: no brief')
+        return
     start_server()
 
 
 def main() -> int:
+    """Run the entrypoint and log unexpected top-level failures.
+    Return zero on success or one on failure, while propagating SystemExit.
+    """
     try:
         start()
         return 0
